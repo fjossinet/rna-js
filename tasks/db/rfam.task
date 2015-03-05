@@ -1,0 +1,151 @@
+#!/usr/bin/env node 
+
+var args = process.argv.splice(2),
+    EventEmitter = require('events').EventEmitter
+    rna = require('../../lib/rna'),
+    utils = rna.utils,
+    GridTaskRunner = rna.task.GridTaskRunner,
+    Rnafold = rna.computations.Rnafold,
+    RNA = rna.molecules.RNA,
+    Glite = rna.glite.Glite,
+    mongo = require('mongoskin'),
+    task_name = undefined,
+    database_host = undefined,
+    database_port = undefined,
+    end_point = undefined,
+    job_id = undefined;
+
+if (args.indexOf("-t") != -1)
+    task_name = args[args.indexOf("-t")+1];
+if (args.indexOf("-h") != -1)
+    database_host = args[args.indexOf("-h")+1];
+if (args.indexOf("-p") != -1)
+    database_port = args[args.indexOf("-p")+1];
+if (args.indexOf("-e") != -1 && args[args.indexOf("-e")+1] == "1")
+    end_point = "https://sbgwms1.in2p3.fr:7443/glite_wms_wmproxy_server";
+else if (args.indexOf("-e") != -1 && args[args.indexOf("-e")+1] == "2")
+    end_point = "https://sbgwms2.in2p3.fr:7443/glite_wms_wmproxy_server";
+if (args.indexOf("-id") != -1)
+    job_id = args[args.indexOf("-id")+1];
+   
+/**
+This task imports the ncRNAs from the Rfam database.
+**/
+var RfamTaskRunner = function() {
+
+    GridTaskRunner.call(this);
+    var self = this;
+    this.rfamFamilyPerJob = 10;
+    this.parallelGreps = 10;
+
+    RfamTaskRunner.prototype.getTotalJobsToSubmit = function(data_stored) {
+        var rfam = new rna.db.Rfam("/tmp");
+        rfam.on('rfamFamiliesDetails available', function(rfamFamiliesDetails) {
+            self.emit('got total jobs to submit', Math.floor(Object.keys(rfamFamiliesDetails).length/self.rfamFamilyPerJob)+1);   
+        });
+        rfam.getRfamFamiliesDetails();
+    };
+
+    RfamTaskRunner.prototype.getScriptContent = function(job_id) {
+        var scriptContent = "./tasks/db/rfam.task -t \""+task_name+"\" -h "+database_host+" -p "+database_port+" -id "+job_id;
+        return scriptContent;
+    };
+
+    RfamTaskRunner.prototype.storeData = function() {
+        self.emit('data stored');            
+    };
+
+    RfamTaskRunner.prototype.doTheJob = function() {
+        var outputs = [],
+            computation = {
+                            _id: new ObjectID(),
+                            outputs: outputs,
+                            task_name: task_name,
+                            date: new Date()
+                        };
+
+        if (job_id) {
+            computation.job_id = job_id;
+            var rfam = new rna.db.Rfam("/tmp/RFAM"),
+                sprintf = require('sprintf'),
+                totalMoleculesProcessed = 0;
+
+            rfam.on('error', function(error) {
+                console.log(error);
+            });
+            rfam.on("seqinfo files available", function() {
+                rfam.on('rfamFamiliesDetails available', function(rfamFamilies) {
+                    var total = Object.keys(rfamFamilies).length,
+                        start = job_id*self.rfamFamilyPerJob+1,
+                        end = job_id*self.rfamFamilyPerJob+self.rfamFamilyPerJob,
+                        current_id = start;
+
+                    if (end > total)
+                        end = total;                      
+                    
+                    rfam.on('error', function(error) {
+                        console.log(error);
+                    });
+
+                    var moleculesChunks = undefined;
+
+                    rfam.on("got organismNames", function() {
+                        if (moleculesChunks.length > 0 ) {
+                            chunk = moleculesChunks.pop();    
+                            chunk.forEach(function(molecule) {
+                                molecule.sequence = molecule.sequence.replace(/-/g,'');
+                                molecule.family = rfamFamilies[molecule.source.split(':').pop()].family;    
+                            });
+                        
+                            rfam.genomeIds2OrganismNames(chunk);
+                        } else {
+                            if (current_id < end) {
+                                rfam.getEntry(sprintf.sprintf("RF%05u",++current_id), 'full');
+                                console.log("current_id "+current_id)
+                            }
+                            else {
+                                console.log("Total Molecules Processed "+totalMoleculesProcessed);
+                                process.exit();
+                            }
+                        }
+                    });
+
+                    rfam.on('entry parsed', function(molecules, consensus2D) {
+                        console.log(molecules.length);
+                        totalMoleculesProcessed += molecules.length;
+                        moleculesChunks = utils.chunks(molecules,self.parallelGreps), //10 genomeIds2OrganismNames requests will be launched in parallel (leaning 10 grep commands)
+                        chunk = moleculesChunks.pop();
+                        chunk.forEach(function(molecule) {
+                            molecule.sequence = molecule.sequence.replace(/-/g,'');
+                            molecule.family = rfamFamilies[molecule.source.split(':').pop()].family;    
+                        });
+
+                        rfam.genomeIds2OrganismNames(chunk);                        
+                        
+                    });                    
+                    
+                    rfam.getEntry(sprintf.sprintf("RF%05u",current_id), 'full');       
+                });
+                rfam.getRfamFamiliesDetails();
+            });
+
+            rfam.generateSeqInfoFiles();
+        }
+
+        
+    };
+
+};
+
+RfamTaskRunner.prototype = new GridTaskRunner();
+
+if (args.length == 0 || !task_name || !database_host || !database_port)
+    console.log("Usage: ./rfam.task -t task_name -h database_host -p database_port [-e glite_end_point]")
+else {
+    var db = mongo.db(database_host +'/'+task_name, {safe:true});
+    var runner = new RfamTaskRunner();
+    if (job_id) //SCRIPT EXECUTION
+        runner.doTheJob();
+    else  //JOB SUBMISSION
+        runner.submitJobs()     
+} 
