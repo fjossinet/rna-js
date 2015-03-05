@@ -1,4 +1,4 @@
-.hgignore
+.gitignore
 .DS_Store
 node_modules/*
 tasks/ryckelynck.js
